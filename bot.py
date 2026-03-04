@@ -331,7 +331,9 @@ async def monitor_loop(app: Application):
                     save_sessions()
                     await send_error_alert(app, chat_id, "no_permission")
                     continue
-
+# ✅ NEW: Silence the proxy lag spam
+                elif ret_code is None:
+                    continue
                 elif ret_code != 0:
                     fail_counts[chat_id] = fail_counts.get(chat_id, 0) + 1
                     if fail_counts[chat_id] == 3:
