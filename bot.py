@@ -18,11 +18,33 @@ logger = logging.getLogger(__name__)
 ASK_API_KEY, ASK_SECRET_KEY = range(2)
 EDIT_API_KEY, EDIT_SECRET_KEY = range(2, 4)
 
+# ── Environment Variables ─────────────────────────────────────────────────────
+# TELEGRAM_TOKEN → Railway Variable (direct connection, no proxy)
+# PROXY_URL      → Railway Variable (IPRoyal SOCKS5 proxy for Bybit only)
+#
+# PROXY_URL format: socks5://user:password@proxy-host:port
+# Example:         socks5://abc123:pass456@geo.iproyal.com:32325
+
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+PROXY_URL      = os.environ.get("PROXY_URL", "")  # IPRoyal SOCKS5 proxy
+
+# ── Build proxy dict for requests (Bybit calls only) ─────────────────────────
+def get_proxy():
+    """
+    Returns proxy dict for requests library.
+    Only used for Bybit API calls — NOT for Telegram.
+    """
+    if PROXY_URL:
+        return {
+            "http":  PROXY_URL,
+            "https": PROXY_URL
+        }
+    return None  # no proxy if not set
+
 # ── JSON File Storage ─────────────────────────────────────────────────────────
 SESSIONS_FILE = "sessions.json"
 
 def load_sessions():
-    """Load sessions from JSON file on startup"""
     try:
         if os.path.exists(SESSIONS_FILE):
             with open(SESSIONS_FILE, "r") as f:
@@ -43,7 +65,6 @@ def load_sessions():
     return {}, {}
 
 def save_sessions():
-    """Save sessions to JSON file"""
     try:
         data = {}
         for chat_id, session in user_sessions.items():
@@ -58,23 +79,33 @@ def save_sessions():
     except Exception as e:
         logger.error(f"Failed to save sessions: {e}")
 
-# ── Load sessions from file on startup ───────────────────────────────────────
+# ── Load sessions on startup ──────────────────────────────────────────────────
 user_sessions, monitoring_active = load_sessions()
-seen_orders = {}  # resets on restart is fine — just re-scans
+seen_orders = {}
 
 # ─── BYBIT API ────────────────────────────────────────────────────────────────
 
 def bybit_sign(api_key, api_secret, params=None, body=None, method="GET"):
+    """
+    MAINNET SIGNATURE FIX:
+    Must use json.dumps with separators=(',', ':') — no spaces in JSON body.
+    Bybit Mainnet is strict and will reject signatures with spaces.
+    """
     timestamp   = str(int(time.time() * 1000))
     recv_window = "5000"
+
     if method == "GET":
         param_str = timestamp + api_key + recv_window + \
             "&".join([f"{k}={v}" for k, v in sorted((params or {}).items())])
     else:
-        param_str = timestamp + api_key + recv_window + json.dumps(body or {})
+        # ✅ CRITICAL FIX: separators=(',', ':') removes all spaces from JSON
+        param_str = timestamp + api_key + recv_window + \
+            json.dumps(body or {}, separators=(',', ':'))
+
     signature = hmac.new(
         api_secret.encode(), param_str.encode(), hashlib.sha256
     ).hexdigest()
+
     return {
         "X-BAPI-API-KEY":     api_key,
         "X-BAPI-TIMESTAMP":   timestamp,
@@ -84,16 +115,38 @@ def bybit_sign(api_key, api_secret, params=None, body=None, method="GET"):
     }
 
 def bybit_request(api_key, api_secret, method, endpoint, params=None, body=None):
-    base = "https://api.bybit.com"
+    """
+    ALL Bybit API calls go through IPRoyal SOCKS5 proxy.
+    This ensures Bybit only sees the IPRoyal IP — matching the whitelisted IP.
+    Telegram calls do NOT use this function and go directly via Railway.
+    """
+    base    = "https://api.bybit.com"
+    proxies = get_proxy()
+
     try:
         headers = bybit_sign(api_key, api_secret, params=params, body=body, method=method)
+
         if method == "GET":
-            r = requests.get(base + endpoint, headers=headers, params=params or {}, timeout=10)
+            r = requests.get(
+                base + endpoint,
+                headers=headers,
+                params=params or {},
+                proxies=proxies,
+                timeout=15
+            )
         else:
-            r = requests.post(base + endpoint, headers=headers, json=body or {}, timeout=10)
+            # ✅ CRITICAL FIX: also use separators here when sending JSON body
+            r = requests.post(
+                base + endpoint,
+                headers=headers,
+                data=json.dumps(body or {}, separators=(',', ':')),
+                proxies=proxies,
+                timeout=15
+            )
         return r.json()
+
     except Exception as e:
-        logger.error(f"Bybit error: {e}")
+        logger.error(f"Bybit request error: {e}")
         return None
 
 def get_p2p_orders(api_key, api_secret, status):
@@ -144,6 +197,10 @@ def get_payment_details(detail_result):
 # ─── ERROR ALERT HELPER ───────────────────────────────────────────────────────
 
 async def send_error_alert(app, chat_id, error_type, detail=""):
+    """
+    Sends alert via Telegram DIRECTLY (no proxy).
+    Railway IP is used for Telegram — fast and reliable.
+    """
     messages = {
         "api_invalid": (
             "🚨 *API KEY ERROR — BOT STOPPED!*\n\n"
@@ -151,7 +208,7 @@ async def send_error_alert(app, chat_id, error_type, detail=""):
             "This can happen if:\n"
             "   • You deleted the API key on Bybit\n"
             "   • API key expired\n"
-            "   • IP restriction changed\n\n"
+            "   • IPRoyal IP changed\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "👉 /mycredentials — See current API\n"
             "👉 /editcredentials — Update it\n"
@@ -170,11 +227,22 @@ async def send_error_alert(app, chat_id, error_type, detail=""):
             "━━━━━━━━━━━━━━━━━━━━\n"
             "👉 /editcredentials — After fixing on Bybit"
         ),
+        "proxy_error": (
+            "🚨 *PROXY ERROR — BOT STOPPED!*\n\n"
+            "❌ Cannot connect through IPRoyal proxy!\n\n"
+            "Possible reasons:\n"
+            "   • PROXY_URL is wrong in Railway Variables\n"
+            "   • IPRoyal subscription expired\n"
+            "   • Proxy server is down\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "👉 Check Railway → Variables → PROXY_URL\n"
+            "👉 Check your IPRoyal dashboard"
+        ),
         "connection_failed": (
             "⚠️ *CONNECTION ERROR!*\n\n"
             "❌ Cannot reach Bybit API!\n\n"
             f"Detail: `{detail}`\n\n"
-            "This may be temporary. Bot will retry automatically.\n"
+            "Bot will retry automatically.\n"
             "If problem continues, use /status to check."
         ),
         "monitor_error": (
@@ -183,6 +251,15 @@ async def send_error_alert(app, chat_id, error_type, detail=""):
             f"Detail: `{detail}`\n\n"
             "Bot is still running and will retry.\n"
             "Use /checkorders to scan manually if needed."
+        ),
+        "no_proxy": (
+            "🚨 *PROXY NOT SET!*\n\n"
+            "❌ PROXY_URL is not configured in Railway!\n\n"
+            "Bybit will reject all requests because\n"
+            "Railway IP is not whitelisted.\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "👉 Railway → Variables → Add PROXY_URL\n"
+            "Format: socks5://user:pass@host:port"
         ),
     }
     text = messages.get(error_type, f"⚠️ *Unknown Error*\n\n`{detail}`")
@@ -195,7 +272,14 @@ async def send_error_alert(app, chat_id, error_type, detail=""):
 
 async def monitor_loop(app: Application):
     logger.info("✅ Monitor loop started")
-    fail_counts = {}  # track consecutive failures per user to avoid alert spam
+    fail_counts    = {}
+    proxy_notified = {}  # track if user was already notified about proxy issue
+
+    # ── Warn all users if PROXY_URL is not set ──
+    if not PROXY_URL:
+        logger.warning("⚠️ PROXY_URL not set — Bybit calls will use direct Railway IP!")
+        for chat_id in list(user_sessions.keys()):
+            await send_error_alert(app, chat_id, "no_proxy")
 
     while True:
         try:
@@ -211,14 +295,20 @@ async def monitor_loop(app: Application):
                     seen_orders[chat_id] = set()
                 seen = seen_orders[chat_id]
 
+                # ── Fetch orders via IPRoyal proxy ──
                 result = get_p2p_orders(api_key, api_secret, "20")
 
-                # ── Handle errors and alert user ──
+                # ── Handle errors ──
                 if result is None:
                     fail_counts[chat_id] = fail_counts.get(chat_id, 0) + 1
                     if fail_counts[chat_id] == 3:
-                        await send_error_alert(app, chat_id, "connection_failed",
-                                               "No response from Bybit")
+                        # Could be proxy issue or Bybit down
+                        if PROXY_URL:
+                            await send_error_alert(app, chat_id, "proxy_error")
+                        else:
+                            await send_error_alert(app, chat_id, "connection_failed",
+                                                   "No response from Bybit")
+                        fail_counts[chat_id] = 0  # reset to avoid spam
                     continue
 
                 ret_code = result.get("retCode")
@@ -246,6 +336,7 @@ async def monitor_loop(app: Application):
                     if fail_counts[chat_id] == 3:
                         await send_error_alert(app, chat_id, "monitor_error",
                                                f"retCode={ret_code} {result.get('retMsg','')}")
+                        fail_counts[chat_id] = 0
                     continue
 
                 fail_counts[chat_id] = 0  # reset on success
@@ -268,11 +359,11 @@ async def monitor_loop(app: Application):
                     pay_method, bank_info = get_payment_details(detail) \
                         if detail else ("Unknown", "   • Not available\n")
 
-                    # STEP 1: Click Transfer Completed
+                    # STEP 1: Click Transfer Completed (via proxy)
                     click_result = click_transfer_completed(api_key, api_secret, oid)
                     clicked      = click_result and click_result.get("retCode") == 0
 
-                    # STEP 2: Message seller
+                    # STEP 2: Message seller (via proxy)
                     seller_message = (
                         f"✅ Payment Has Been Sent!\n\n"
                         f"Dear {seller},\n"
@@ -286,7 +377,7 @@ async def monitor_loop(app: Application):
                     )
                     send_msg_to_seller(api_key, api_secret, oid, seller_message)
 
-                    # STEP 3: Alert user
+                    # STEP 3: Alert user via Telegram (DIRECT — no proxy)
                     alert = (
                         f"🚨 *NEW ORDER — SEND PAYMENT NOW!*\n"
                         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -329,6 +420,7 @@ async def remind_after_5_min(app, chat_id, oid, seller, amount, currency, pay_me
     try:
         if not monitoring_active.get(chat_id, True):
             return
+        # Telegram alert — DIRECT connection, no proxy
         await app.bot.send_message(
             chat_id=chat_id,
             text=(
@@ -355,9 +447,8 @@ async def remind_after_5_min(app, chat_id, oid, seller, amount, currency, pay_me
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
-    # Already has credentials — show management menu
     if chat_id in user_sessions:
-        session   = user_sessions[chat_id]
+        session     = user_sessions[chat_id]
         key_preview = session["api_key"][:6] + "••••" + session["api_key"][-4:]
         await update.message.reply_text(
             f"⚠️ *You already have credentials saved!*\n\n"
@@ -410,7 +501,7 @@ async def save_credentials(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "⏳ *Verifying your credentials...*\n\n"
-        "🔄 Connecting to Bybit...\n"
+        "🔄 Connecting to Bybit via IPRoyal proxy...\n"
         "🔑 Checking API Key...\n"
         "🔐 Checking API Secret...\n"
         "📋 Checking P2P permissions...",
@@ -431,12 +522,29 @@ async def save_credentials(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
+    # Check proxy is configured
+    if not PROXY_URL:
+        await update.message.reply_text(
+            "⚠️ *Warning: PROXY_URL not set!*\n\n"
+            "Bybit calls will use Railway IP directly.\n"
+            "This will FAIL if you whitelisted IPRoyal IP on Bybit.\n\n"
+            "Add PROXY_URL in Railway Variables first!\n"
+            "Format: `socks5://user:pass@host:port`",
+            parse_mode="Markdown"
+        )
+
     try:
+        # Verify via proxy
         result = bybit_request(api_key, api_secret, "GET", "/v5/user/query-api")
 
         if result is None:
             await update.message.reply_text(
-                "❌ *Cannot connect to Bybit*\n\nCheck internet.\nRun /start again.",
+                "❌ *Cannot connect to Bybit*\n\n"
+                "Possible reasons:\n"
+                "• PROXY_URL is wrong or not set\n"
+                "• IPRoyal proxy is down\n"
+                "• Internet issue\n\n"
+                "Check Railway Variables → PROXY_URL",
                 parse_mode="Markdown"
             )
             return ConversationHandler.END
@@ -450,13 +558,14 @@ async def save_credentials(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_sessions[chat_id]     = {"api_key": api_key, "api_secret": api_secret}
             seen_orders[chat_id]       = set()
             monitoring_active[chat_id] = True
-            save_sessions()  # ✅ Save to JSON
+            save_sessions()
 
             await update.message.reply_text(
                 "🎉 *Access Successful!*\n\n"
                 "🔑 API Key: ✅ Valid\n"
                 "🔐 API Secret: ✅ Valid\n"
-                "🌐 Bybit: ✅ Connected\n"
+                "🌐 Bybit: ✅ Connected via IPRoyal\n"
+                "📡 Telegram: ✅ Direct Railway connection\n"
                 f"📋 P2P: {'✅ Enabled' if has_p2p else '⚠️ Enable P2P in Bybit API!'}\n\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
                 "💾 *Credentials saved — bot remembers you after restart!*\n\n"
@@ -519,17 +628,19 @@ async def mycredentials(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    api_key    = session["api_key"]
-    api_secret = session["api_secret"]
+    api_key       = session["api_key"]
+    api_secret    = session["api_secret"]
     key_masked    = api_key[:6]    + "••••••••••" + api_key[-4:]
     secret_masked = api_secret[:4] + "••••••••••••••••" + api_secret[-4:]
     is_running    = monitoring_active.get(chat_id, False)
+    proxy_status  = f"`{PROXY_URL[:30]}...`" if PROXY_URL else "❌ Not set!"
 
     await update.message.reply_text(
         f"👁 *Your Current Credentials*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🔑 API Key:\n`{key_masked}`\n\n"
         f"🔐 API Secret:\n`{secret_masked}`\n\n"
+        f"📡 Proxy (IPRoyal): {proxy_status}\n"
         f"📊 Monitoring: {'✅ Running' if is_running else '⏹ Stopped'}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"What would you like to do?",
@@ -574,7 +685,10 @@ async def edit_save_credentials(update: Update, context: ContextTypes.DEFAULT_TY
     api_key    = context.user_data.get("new_api_key")
     api_secret = update.message.text.strip()
 
-    await update.message.reply_text("⏳ Verifying new credentials...", parse_mode="Markdown")
+    await update.message.reply_text(
+        "⏳ Verifying new credentials via IPRoyal proxy...",
+        parse_mode="Markdown"
+    )
 
     result = bybit_request(api_key, api_secret, "GET", "/v5/user/query-api")
 
@@ -583,15 +697,14 @@ async def edit_save_credentials(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text(
             f"❌ *Verification Failed!*\n\n"
             f"Code: `{code}`\n\n"
-            f"Old credentials are still active.\n"
+            f"Old credentials still active.\n"
             f"Try /editcredentials again.",
             parse_mode="Markdown"
         )
-        monitoring_active[chat_id] = True  # resume with old creds
+        monitoring_active[chat_id] = True
         save_sessions()
         return ConversationHandler.END
 
-    # Save new credentials
     user_sessions[chat_id]     = {"api_key": api_key, "api_secret": api_secret}
     seen_orders[chat_id]       = set()
     monitoring_active[chat_id] = True
@@ -601,7 +714,8 @@ async def edit_save_credentials(update: Update, context: ContextTypes.DEFAULT_TY
     await update.message.reply_text(
         f"✅ *Credentials Updated Successfully!*\n\n"
         f"🔑 New API Key: `{key_masked}`\n"
-        f"🔐 New Secret: ✅ Saved\n\n"
+        f"🔐 New Secret: ✅ Saved\n"
+        f"📡 Verified via IPRoyal proxy ✅\n\n"
         f"▶️ Monitoring resumed automatically!",
         parse_mode="Markdown"
     )
@@ -640,11 +754,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if session:
             key_masked    = session["api_key"][:6]    + "••••••••••" + session["api_key"][-4:]
             secret_masked = session["api_secret"][:4] + "••••••••••••••••" + session["api_secret"][-4:]
+            proxy_status  = "✅ Set" if PROXY_URL else "❌ Not set!"
             await query.edit_message_text(
                 f"👁 *Your Current Credentials*\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"🔑 API Key:\n`{key_masked}`\n\n"
                 f"🔐 API Secret:\n`{secret_masked}`\n\n"
+                f"📡 IPRoyal Proxy: {proxy_status}\n"
                 f"📊 Monitoring: {'✅ Running' if monitoring_active.get(chat_id) else '⏹ Stopped'}\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"Use /editcredentials to change\n"
@@ -657,7 +773,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_sessions()
         await query.edit_message_text(
             "✏️ *Ready to edit.*\n\n"
-            "Send /editcredentials to start entering your new API keys.",
+            "Send /editcredentials to start.",
             parse_mode="Markdown"
         )
 
@@ -676,7 +792,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_sessions.pop(chat_id, None)
         seen_orders.pop(chat_id, None)
         monitoring_active.pop(chat_id, None)
-        save_sessions()
+        save_sessions()  # ✅ persist removal to JSON file
         await query.edit_message_text(
             "🗑 *Credentials Removed!*\n\n"
             "✅ All data cleared.\n\n"
@@ -727,9 +843,10 @@ async def startbot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "▶️ *Bot Monitoring STARTED!*\n\n"
         "✅ Checking Bybit every 15 seconds\n"
+        "✅ Bybit calls via IPRoyal proxy\n"
+        "✅ Telegram alerts via direct Railway\n"
         "✅ Will auto-click Transfer Completed\n"
-        "✅ Will alert you with bank details\n"
-        "✅ Will message seller automatically\n\n"
+        "✅ Will alert you with bank details\n\n"
         "⏹ Use /stopbot to pause anytime.",
         parse_mode="Markdown"
     )
@@ -754,7 +871,7 @@ async def checkorders(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ No credentials. Run /start first.")
         return
 
-    await update.message.reply_text("🔄 Scanning your Bybit P2P orders...")
+    await update.message.reply_text("🔄 Scanning your Bybit P2P orders via proxy...")
 
     api_key    = session["api_key"]
     api_secret = session["api_secret"]
@@ -818,15 +935,18 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         k = user_sessions[chat_id]["api_key"]
         key_info = f"\n🔑 API Key: `{k[:6]}••••{k[-4:]}`"
 
+    proxy_status = "✅ IPRoyal connected" if PROXY_URL else "❌ PROXY_URL not set!"
+
     await update.message.reply_text(
         f"📊 *Bot Status*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🔑 Credentials: {'✅ Saved' if has_cred else '❌ Not set — run /start'}"
         f"{key_info}\n"
+        f"📡 Proxy: {proxy_status}\n"
         f"🔍 Monitoring: {'✅ Running every 15 sec' if is_running else '⏹ Stopped'}\n"
         f"⚡ Auto Transfer Click: {'✅ ON' if is_running else '⏹ OFF'}\n"
         f"💬 Auto Seller Message: {'✅ ON' if is_running else '⏹ OFF'}\n"
-        f"🔔 Telegram Alerts: {'✅ ON' if is_running else '⏹ OFF'}\n"
+        f"🔔 Telegram Alerts: {'✅ ON (Direct Railway)' if is_running else '⏹ OFF'}\n"
         f"⏰ 5 Min Reminder: {'✅ ON' if is_running else '⏹ OFF'}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"Commands:\n"
@@ -845,11 +965,19 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─── START APP ────────────────────────────────────────────────────────────────
 
 async def main():
-    token = os.environ.get("TELEGRAM_TOKEN")
-    if not token:
-        raise ValueError("TELEGRAM_TOKEN not set!")
+    # ── Validate environment variables ──
+    if not TELEGRAM_TOKEN:
+        raise ValueError("❌ TELEGRAM_TOKEN not set in Railway Variables!")
 
-    app = Application.builder().token(token).build()
+    if not PROXY_URL:
+        logger.warning("⚠️ PROXY_URL not set — Bybit calls will NOT use proxy!")
+        logger.warning("⚠️ This will FAIL if IPRoyal IP is whitelisted on Bybit!")
+    else:
+        logger.info(f"✅ PROXY_URL loaded — Bybit calls via IPRoyal")
+        logger.info(f"✅ Telegram calls via direct Railway connection")
+
+    # ── Telegram uses direct Railway connection (no proxy) ──
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     # /start conversation
     conv = ConversationHandler(
@@ -889,6 +1017,8 @@ async def main():
     app.add_handler(CommandHandler("removecredentials", removecredentials))
 
     logger.info("🤖 Bot running!")
+    logger.info("📡 Telegram: Direct Railway connection")
+    logger.info(f"🔒 Bybit: {'Via IPRoyal SOCKS5 proxy' if PROXY_URL else 'Direct (no proxy set)'}")
 
     async with app:
         await app.start()
