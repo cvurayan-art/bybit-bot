@@ -413,7 +413,7 @@ async def monitor_loop(app: Application):
         except Exception as e:
             logger.error(f"Monitor error: {e}")
 
-        await asyncio.sleep(15)
+        await asyncio.sleep(25)
 
 
 async def remind_after_5_min(app, chat_id, oid, seller, amount, currency, pay_method, bank_info):
